@@ -168,7 +168,7 @@ steps:
         depends_on: ~
         id: build-nightly-docker-x86
         agents:
-          queue: cpu_queue_postmerge
+          queue: cpu_queue_premerge_us_east_1
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-x86_64"

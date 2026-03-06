@@ -9,7 +9,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesRequest, V1RerankReqInput,
+            RerankRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -309,7 +309,7 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ResponsesRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -317,7 +317,7 @@ async fn v1_responses(
 
     state
         .router
-        .route_responses(Some(&headers), &body, None)
+        .route_transparent(Some(&headers), "/v1/responses", &http::Method::POST, body)
         .await
 }
 

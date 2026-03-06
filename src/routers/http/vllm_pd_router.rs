@@ -139,9 +139,10 @@ impl VllmPDRouter {
         self.pd_router.stop_profiling(worker_url).await;
     }
 
-    /// Modify request for prefill stage (set max_tokens=1)
+    /// Modify request for prefill stage (limit output to 1 token)
     /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
-    /// - For other endpoints (fallback): patch top-level max_tokens, max_completion_tokens, min_tokens
+    /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
+    /// - For other OpenAI endpoints (chat/completions): patch max_tokens, max_completion_tokens, min_tokens
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
@@ -161,8 +162,11 @@ impl VllmPDRouter {
                 // Create sampling_params with prefill defaults when missing
                 request["sampling_params"] = json!({"max_tokens": 1, "min_tokens": 1});
             }
+        } else if path.contains("/v1/responses") {
+            // Responses API: only uses max_output_tokens (not max_tokens/max_completion_tokens)
+            request["max_output_tokens"] = json!(1);
         } else {
-            // Fallback: OpenAI-style endpoints (chat/completions)
+            // OpenAI chat/completions endpoints
             request["max_tokens"] = json!(1);
             if request.get("max_completion_tokens").is_some() {
                 request["max_completion_tokens"] = json!(1);
@@ -1511,10 +1515,19 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ResponsesRequest,
-        model_id: Option<&str>,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router
-            .route_responses(headers, body, model_id)
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(headers, "/v1/responses", &Method::POST, request_json)
             .await
     }
 
@@ -1792,6 +1805,38 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    // --- Responses API endpoint tests (/v1/responses) ---
+
+    #[test]
+    fn test_prefill_responses_patches_max_output_tokens() {
+        let request = json!({
+            "model": "test",
+            "input": "What is the capital of France?",
+            "max_output_tokens": 1024,
+            "stream": true
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        assert_eq!(result["max_output_tokens"], 1);
+        // Responses API doesn't use max_tokens, so it should not be injected
+        assert!(result.get("max_tokens").is_none());
+        assert_eq!(result["stream"], false);
+    }
+
+    #[test]
+    fn test_prefill_responses_without_max_output_tokens() {
+        let request = json!({
+            "model": "test",
+            "input": "Hello",
+            "stream": false
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        // For /v1/responses, max_output_tokens should always be forced to 1
+        assert_eq!(result["max_output_tokens"], 1);
+        // Responses API doesn't use max_tokens, so it should not be injected
+        assert!(result.get("max_tokens").is_none());
+        assert_eq!(result["stream"], false);
     }
 
     // --- Generate API endpoint tests (inference/v1/generate) ---
