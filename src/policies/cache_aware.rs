@@ -173,55 +173,40 @@ impl CacheAwarePolicy {
         }
     }
 
-    fn select_worker_min_load(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        token_ids: &[u32],
-        healthy_indices: &[usize],
-        model_id: &str,
-        max_load: usize,
-        min_load: usize,
-    ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
-            );
-        }
+}
 
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
+/// Score a worker for routing using the unified cache-aware formula.
+///
+/// Returns `None` when the worker should be hard-excluded (KV utilization at or above
+/// `kv_high_watermark`). Otherwise returns a score where higher is better.
+///
+/// Formula:
+///   token_pressure = (running_tokens / token_capacity)^2
+///   kv_pressure    = kv_util^3
+///   load_penalty   = alpha * token_pressure + beta * kv_pressure
+///   cache_value    = cache_match * ln(1 + input_tokens)
+///   score          = cache_value - lambda * load_penalty
+fn score_worker(
+    worker: &dyn Worker,
+    cache_match: f32,
+    input_tokens: usize,
+    config: &CacheAwareConfig,
+) -> Option<f32> {
+    let kv_util = worker.kv_cache_utilization();
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
-
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if !token_ids.is_empty() {
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(token_ids, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
-            }
-        }
-
-        workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-        Some(min_load_idx)
+    if kv_util >= config.kv_high_watermark {
+        return None; // hard exclusion
     }
+
+    let token_pressure = {
+        let r = worker.running_tokens() as f32 / config.token_capacity as f32;
+        r * r
+    };
+    let kv_pressure = kv_util * kv_util * kv_util;
+    let load_penalty = config.alpha * token_pressure + config.beta * kv_pressure;
+    let cache_value = cache_match * (1.0_f32 + input_tokens as f32).ln();
+
+    Some(cache_value - config.lambda * load_penalty)
 }
 
 /// Tokenize `prompt` by calling the vLLM `/tokenize` endpoint on `worker_url`.
@@ -301,117 +286,109 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             vec![]
         };
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let input_tokens = token_ids.len();
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
-        debug!(
-            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
-            max_load, min_load, is_imbalanced
-        );
-
-        if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                &token_ids,
-                &healthy_indices,
-                model_id,
-                max_load,
-                min_load,
-            );
-        }
-
-        // Use cache-aware routing when balanced
+        // Retrieve tree for this model (may be absent for newly-initialized models)
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
-        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
-        debug!("Available tree keys: {:?}", keys);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
+            debug!("Available tree keys: {:?}", keys);
+        }
 
-        let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected_idx = healthy_indices[random_idx];
-
-            workers[selected_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[selected_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
-
-            return Some(selected_idx);
-        };
-
-        debug!("Using cache-aware routing for model '{}'", model_id);
-
-        let result = tree.prefix_match_with_counts(&token_ids);
-        let match_rate = if result.input_token_count == 0 {
-            0.0
-        } else {
-            result.matched_token_count as f32 / result.input_token_count as f32
+        // Compute prefix-match result; use a zeroed sentinel when no tree exists yet
+        let result = match &tree {
+            Some(t) => t.prefix_match_with_counts(&token_ids),
+            None => {
+                debug!(
+                    "No tree found for model '{}', proceeding with zero cache match",
+                    model_id
+                );
+                // Safe zero-valued result: all workers get cache_match = 0.0
+                crate::tree::PrefixMatchTokenResult {
+                    tenant: String::new().into(),
+                    matched_token_count: 0,
+                    input_token_count: input_tokens,
+                }
+            }
         };
 
         debug!(
-            "Cache match for model '{}': matched_tokens={}, input_tokens={}, match_rate={:.2}",
-            model_id, result.matched_token_count, result.input_token_count, match_rate
+            "Cache match for model '{}': matched_tokens={}, input_tokens={}, best_tenant='{}'",
+            model_id, result.matched_token_count, result.input_token_count, result.tenant
         );
 
-        // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
-            // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
-        } else {
-            // Low cache match: use worker with minimum load
+        // Score every healthy worker using the unified formula.
+        // cache_match is non-zero only for the worker identified by the prefix tree.
+        let tenant_url: &str = &result.tenant;
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = f32::NEG_INFINITY;
+
+        for &idx in &healthy_indices {
+            let worker = &*workers[idx];
+            let cache_match = if !tenant_url.is_empty() && worker.url() == tenant_url {
+                result.matched_token_count as f32 / result.input_token_count.max(1) as f32
+            } else {
+                0.0_f32
+            };
+
+            if let Some(score) = score_worker(worker, cache_match, input_tokens, &self.config) {
+                debug!(
+                    "Worker '{}': cache_match={:.3}, score={:.4}",
+                    worker.url(),
+                    cache_match,
+                    score
+                );
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(idx);
+                }
+            } else {
+                debug!(
+                    "Worker '{}' hard-excluded (kv_util={:.3} >= watermark={:.3})",
+                    worker.url(),
+                    worker.kv_cache_utilization(),
+                    self.config.kv_high_watermark
+                );
+            }
+        }
+
+        // Fallback when ALL workers are hard-excluded: pick lowest KV utilization
+        let selected_idx = if best_idx.is_none() {
+            warn!(
+                "All healthy workers for model '{}' are hard-excluded by kv_high_watermark; \
+                 falling back to lowest-KV worker",
+                model_id
+            );
             healthy_indices
                 .iter()
-                .min_by_key(|&&idx| workers[idx].load())
+                .min_by(|&&a, &&b| {
+                    workers[a]
+                        .kv_cache_utilization()
+                        .partial_cmp(&workers[b].kv_cache_utilization())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .copied()
+        } else {
+            best_idx
         };
 
-        if let Some(idx) = selected_idx {
-            // Update the tree with this request's tokens
-            if !token_ids.is_empty() {
-                tree.insert(&token_ids, workers[idx].url());
+        let Some(idx) = selected_idx else {
+            return None;
+        };
+
+        // Insert token_ids into tree for the selected worker
+        if !token_ids.is_empty() {
+            if let Some(t) = &tree {
+                t.insert(&token_ids, workers[idx].url());
             }
-
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            return Some(idx);
         }
 
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
-            let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
-        }
+        workers[idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
 
-        // Fallback to first healthy worker
-        if let Some(idx) = healthy_indices.first().copied() {
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            Some(idx)
-        } else {
-            None
-        }
+        Some(idx)
     }
 
     fn name(&self) -> &'static str {
@@ -422,16 +399,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool, _tokens: usize) {
-        // Could track success rates per worker for more intelligent routing
-        if !success {
-            // Optionally reduce affinity for failed requests
-            tracing::debug!(
-                "Request to {} completed with success={}",
-                worker_url,
-                success
-            );
-        }
+    fn on_request_complete(&self, worker_url: &str, success: bool, tokens: usize) {
+        // Token decrement is handled by the caller (router) via decrement_load_with_tokens.
+        // Log completion details for observability.
+        tracing::debug!(
+            "Request to {} completed: success={}, tokens={}",
+            worker_url,
+            success,
+            tokens
+        );
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -578,6 +554,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            ..Default::default()
         });
 
         let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);

@@ -402,6 +402,12 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                alpha: 1.0,
+                beta: 1.0,
+                lambda: 1.0,
+                kv_high_watermark: 0.90,
+                token_capacity: 32768,
+                kv_ttl_ms: 150,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value

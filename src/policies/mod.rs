@@ -143,10 +143,24 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// Deprecated: kept for backward compatibility; no longer used in routing logic
     pub balance_abs_threshold: usize,
+    /// Deprecated: kept for backward compatibility; no longer used in routing logic
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    /// Weight for token pressure in scoring formula
+    pub alpha: f32,
+    /// Weight for KV cache pressure in scoring formula
+    pub beta: f32,
+    /// Scale factor for load penalty in scoring formula
+    pub lambda: f32,
+    /// Hard exclusion threshold: workers at or above this KV utilization are excluded
+    pub kv_high_watermark: f32,
+    /// Maximum tokens per worker (used to compute token pressure ratio)
+    pub token_capacity: usize,
+    /// KV cache TTL in milliseconds (staleness guard for cached utilization readings)
+    pub kv_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -157,6 +171,12 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            alpha: 1.0,
+            beta: 1.0,
+            lambda: 1.0,
+            kv_high_watermark: 0.90,
+            token_capacity: 32768,
+            kv_ttl_ms: 150,
         }
     }
 }

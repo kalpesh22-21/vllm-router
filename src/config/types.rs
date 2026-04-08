@@ -95,6 +95,30 @@ fn default_intra_node_data_parallel_size() -> usize {
     1
 }
 
+fn default_alpha() -> f32 {
+    1.0
+}
+
+fn default_beta() -> f32 {
+    1.0
+}
+
+fn default_lambda() -> f32 {
+    1.0
+}
+
+fn default_kv_high_watermark() -> f32 {
+    0.90
+}
+
+fn default_token_capacity() -> usize {
+    32768
+}
+
+fn default_kv_ttl_ms() -> u64 {
+    150
+}
+
 /// History backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -233,14 +257,32 @@ pub enum PolicyConfig {
     CacheAware {
         /// Minimum prefix match ratio to use cache-based routing
         cache_threshold: f32,
-        /// Absolute load difference threshold for load balancing
+        /// Deprecated: kept for backward compatibility; no longer used in routing logic
         balance_abs_threshold: usize,
-        /// Relative load ratio threshold for load balancing
+        /// Deprecated: kept for backward compatibility; no longer used in routing logic
         balance_rel_threshold: f32,
         /// Interval between cache eviction cycles (seconds)
         eviction_interval_secs: u64,
         /// Maximum cache tree size per tenant
         max_tree_size: usize,
+        /// Weight for token pressure in unified scoring formula
+        #[serde(default = "default_alpha")]
+        alpha: f32,
+        /// Weight for KV cache pressure in unified scoring formula
+        #[serde(default = "default_beta")]
+        beta: f32,
+        /// Scale factor for load penalty in unified scoring formula
+        #[serde(default = "default_lambda")]
+        lambda: f32,
+        /// Hard exclusion threshold: workers at or above this KV utilization are excluded
+        #[serde(default = "default_kv_high_watermark")]
+        kv_high_watermark: f32,
+        /// Maximum tokens per worker for token pressure calculation
+        #[serde(default = "default_token_capacity")]
+        token_capacity: usize,
+        /// KV cache TTL in milliseconds
+        #[serde(default = "default_kv_ttl_ms")]
+        kv_ttl_ms: u64,
     },
 
     #[serde(rename = "power_of_two")]

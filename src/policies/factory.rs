@@ -23,6 +23,12 @@ impl PolicyFactory {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                alpha,
+                beta,
+                lambda,
+                kv_high_watermark,
+                token_capacity,
+                kv_ttl_ms,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -30,6 +36,12 @@ impl PolicyFactory {
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
+                    alpha: *alpha,
+                    beta: *beta,
+                    lambda: *lambda,
+                    kv_high_watermark: *kv_high_watermark,
+                    token_capacity: *token_capacity,
+                    kv_ttl_ms: *kv_ttl_ms,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -81,6 +93,12 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 30,
             max_tree_size: 1000,
+            alpha: 1.0,
+            beta: 1.0,
+            lambda: 1.0,
+            kv_high_watermark: 0.90,
+            token_capacity: 32768,
+            kv_ttl_ms: 150,
         });
         assert_eq!(policy.name(), "cache_aware");
 

@@ -11,7 +11,8 @@
       "Read(//usr/local/bin/**)",
       "Bash(/Users/kalpeshmulye/.cargo/bin/cargo check:*)",
       "Bash(~/.cargo/bin/cargo check:*)",
-      "Bash(~/.cargo/bin/cargo test:*)"
+      "Bash(~/.cargo/bin/cargo test:*)",
+      "Bash(~/.cargo/bin/cargo build:*)"
     ]
   }
 }
