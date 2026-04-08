@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ':*)",
+      "Bash(cargo build:*)",
+      "Bash(/Users/kalpeshmulye/.cargo/bin/cargo build:*)",
+      "Bash(brew install:*)",
+      "Bash(/Users/kalpeshmulye/.cargo/bin/cargo test:*)",
+      "Bash(python3 /tmp/fix_docs.py)",
+      "Bash(cargo check:*)",
+      "Read(//usr/local/bin/**)",
+      "Bash(/Users/kalpeshmulye/.cargo/bin/cargo check:*)",
+      "Bash(~/.cargo/bin/cargo check:*)",
+      "Bash(~/.cargo/bin/cargo test:*)"
+    ]
+  }
+}

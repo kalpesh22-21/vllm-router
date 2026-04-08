@@ -6,7 +6,8 @@ use futures;
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
@@ -16,6 +17,55 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("Failed to create worker HTTP client")
 });
+
+
+/// Time-to-live for the KV cache utilization reading.
+/// After this duration the cached value is considered stale and a background
+/// refresh is triggered on the next call to `kv_cache_utilization()`.
+const KV_TTL: Duration = Duration::from_millis(150);
+
+/// Fetch the GPU KV-cache utilization for a worker by scraping its Prometheus metrics endpoint.
+///
+/// Issues a GET to `{worker_url}/metrics` and parses the Prometheus text format to extract
+/// the `vllm:gpu_cache_usage_perc` gauge.  Returns a value in the range [0.0, 1.0] on
+/// success, or an error if the request fails or the metric is not found.
+pub async fn fetch_kv_utilization(worker_url: &str) -> Result<f32, anyhow::Error> {
+    let metrics_url = format!("{}/metrics", worker_url.trim_end_matches('/'));
+    let response = WORKER_CLIENT
+        .get(&metrics_url)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await?;
+
+    let body = response.text().await?;
+
+    // Parse Prometheus text format line-by-line looking for:
+    //   vllm:gpu_cache_usage_perc{...} <value>
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Skip comment / help / type lines
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // The metric name is everything up to the first '{' or whitespace
+        let name_end = trimmed
+            .find(|c: char| c == '{' || c.is_whitespace())
+            .unwrap_or(trimmed.len());
+        let name = &trimmed[..name_end];
+        if name != "vllm:gpu_cache_usage_perc" {
+            continue;
+        }
+        // Value is the last whitespace-separated token on the line
+        let value_str = trimmed.rsplit_once(' ').map(|(_, v)| v).unwrap_or("");
+        let value: f32 = value_str.parse()?;
+        return Ok(value);
+    }
+
+    Err(anyhow::anyhow!(
+        "vllm:gpu_cache_usage_perc not found in metrics for {}",
+        worker_url
+    ))
+}
 
 /// Core worker abstraction that represents a backend service
 #[async_trait]
@@ -212,6 +262,46 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("chat_template")
             .map(|s| s.as_str())
     }
+
+    // === KV cache utilization methods ===
+
+    /// Return the number of currently running tokens across all sequences on this worker.
+    ///
+    /// The default implementation returns 0; concrete workers should override this.
+    fn running_tokens(&self) -> usize {
+        0
+    }
+
+    /// Return the most recently cached GPU KV-cache utilization in the range [0.0, 1.0].
+    ///
+    /// If the cached value is older than `KV_TTL` a fire-and-forget background task
+    /// is spawned to refresh it, but this call always returns immediately without blocking.
+    /// The default implementation returns 0.0; concrete workers override this.
+    fn kv_cache_utilization(&self) -> f32 {
+        0.0
+    }
+
+    /// Increment the load counter *and* add `tokens` to the running-token counter.
+    ///
+    /// Callers that know the token count of a request should prefer this over
+    /// bare [`increment_load`] so that KV-pressure scoring can use the data.
+    fn increment_load_with_tokens(&self, tokens: usize) {
+        self.increment_load();
+        let _ = tokens; // default: token count not tracked
+    }
+
+    /// Decrement the load counter *and* subtract `tokens` from the running-token counter.
+    fn decrement_load_with_tokens(&self, tokens: usize) {
+        self.decrement_load();
+        let _ = tokens; // default: token count not tracked
+    }
+
+    /// Overwrite the cached KV-cache utilization value.
+    ///
+    /// Called by the async refresh task once a fresh value has been fetched.
+    fn set_kv_cache_utilization(&self, _value: f32) {
+        // default: no-op
+    }
 }
 
 /// Connection mode for worker communication
@@ -319,6 +409,13 @@ pub struct BasicWorker {
     circuit_breaker: CircuitBreaker,
     /// Optional gRPC client for gRPC workers
     grpc_client: Option<Arc<Mutex<VllmSchedulerClient>>>,
+    /// Count of tokens currently being processed across all active requests on this worker.
+    running_tokens: Arc<AtomicUsize>,
+    /// Cached (utilization, last_fetched) pair for GPU KV-cache utilization.
+    ///
+    /// Initialised to (0.0, very_old) so the first call to `kv_cache_utilization()`
+    /// immediately triggers a background refresh.
+    kv_cache_utilization: Arc<RwLock<(f32, Instant)>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -359,6 +456,13 @@ impl BasicWorker {
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
             grpc_client: None,
+            running_tokens: Arc::new(AtomicUsize::new(0)),
+            // Initialise with a timestamp far in the past so the first call to
+            // kv_cache_utilization() triggers an immediate background refresh.
+            kv_cache_utilization: Arc::new(RwLock::new((
+                0.0_f32,
+                Instant::now() - Duration::from_secs(3600),
+            ))),
         }
     }
 
@@ -540,6 +644,68 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn running_tokens(&self) -> usize {
+        self.running_tokens.load(Ordering::Relaxed)
+    }
+
+    fn kv_cache_utilization(&self) -> f32 {
+        let cached = {
+            // Hold the read lock only long enough to copy the cached value.
+            let guard = self.kv_cache_utilization.read().expect("kv_cache lock poisoned");
+            *guard
+        };
+
+        let (value, last_fetched) = cached;
+
+        // If the cached value is stale, spawn a fire-and-forget background task.
+        // We guard with try_current() so that calling kv_cache_utilization() from a
+        // non-async context (e.g. a sync unit test) does not panic.
+        if last_fetched.elapsed() > KV_TTL {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let url = self.metadata.url.clone();
+                let kv_arc = Arc::clone(&self.kv_cache_utilization);
+                handle.spawn(async move {
+                    match fetch_kv_utilization(&url).await {
+                        Ok(v) => {
+                            if let Ok(mut guard) = kv_arc.write() {
+                                *guard = (v, Instant::now());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("KV cache refresh failed for {}: {}", url, e);
+                        }
+                    }
+                });
+            }
+        }
+
+        value
+    }
+
+    fn increment_load_with_tokens(&self, tokens: usize) {
+        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        self.running_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    fn decrement_load_with_tokens(&self, tokens: usize) {
+        self.load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .ok();
+        self.running_tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(tokens)
+            })
+            .ok();
+    }
+
+    fn set_kv_cache_utilization(&self, value: f32) {
+        if let Ok(mut guard) = self.kv_cache_utilization.write() {
+            *guard = (value, Instant::now());
+        }
     }
 }
 
@@ -2044,5 +2210,125 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+}
+
+#[cfg(test)]
+mod kv_cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_running_tokens_initial_zero() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        assert_eq!(worker.running_tokens(), 0);
+    }
+
+    #[test]
+    fn test_increment_load_with_tokens() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        worker.increment_load_with_tokens(100);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(worker.running_tokens(), 100);
+
+        worker.increment_load_with_tokens(50);
+        assert_eq!(worker.load(), 2);
+        assert_eq!(worker.running_tokens(), 150);
+    }
+
+    #[test]
+    fn test_decrement_load_with_tokens() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        worker.increment_load_with_tokens(200);
+        worker.increment_load_with_tokens(100);
+        assert_eq!(worker.load(), 2);
+        assert_eq!(worker.running_tokens(), 300);
+
+        worker.decrement_load_with_tokens(100);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(worker.running_tokens(), 200);
+
+        worker.decrement_load_with_tokens(200);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.running_tokens(), 0);
+    }
+
+    #[test]
+    fn test_decrement_load_with_tokens_no_underflow() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // Decrement below 0 should saturate at 0
+        worker.decrement_load_with_tokens(500);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.running_tokens(), 0);
+    }
+
+    #[test]
+    fn test_set_kv_cache_utilization() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // Initial value before any refresh should be 0.0 (stale placeholder)
+        // We cannot call kv_cache_utilization() in a non-tokio context without
+        // spawning a task, so we test set_kv_cache_utilization directly.
+        worker.set_kv_cache_utilization(0.75);
+
+        let guard = worker
+            .kv_cache_utilization
+            .read()
+            .expect("lock not poisoned");
+        assert!((guard.0 - 0.75).abs() < f32::EPSILON);
+        // The timestamp should be recent
+        assert!(guard.1.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn test_increment_load_with_tokens_does_not_affect_existing_load() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // Existing increment_load still works independently
+        worker.increment_load();
+        worker.increment_load();
+        assert_eq!(worker.load(), 2);
+        assert_eq!(worker.running_tokens(), 0); // tokens unaffected
+
+        worker.increment_load_with_tokens(50);
+        assert_eq!(worker.load(), 3);
+        assert_eq!(worker.running_tokens(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_kv_cache_utilization_returns_cached_immediately() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // Pre-seed a fresh value so no refresh is triggered
+        worker.set_kv_cache_utilization(0.42);
+
+        // Since we just set it, the timestamp is fresh and the cached value
+        // should be returned immediately without any network call.
+        let val = worker.kv_cache_utilization();
+        assert!((val - 0.42).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_kv_cache_stale_triggers_background_refresh_does_not_block() {
+        // Worker points to a non-existent URL — the background task will fail,
+        // but kv_cache_utilization() must not block or panic.
+        let worker = BasicWorker::new(
+            "http://127.0.0.1:19999".to_string(),
+            WorkerType::Regular,
+        );
+
+        // The initial timestamp is very old (set in constructor), so a refresh
+        // is triggered on the first call. The call should return immediately
+        // with the stale 0.0 value.
+        let val = worker.kv_cache_utilization();
+        assert_eq!(val, 0.0);
+
+        // Give the background task a moment to attempt (and fail) the request
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Value should still be 0.0 since the fetch failed
+        let val2 = worker.kv_cache_utilization();
+        assert_eq!(val2, 0.0);
     }
 }

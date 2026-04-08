@@ -89,7 +89,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is called when a request completes (successfully or not) to allow
     /// policies to update their internal state.
-    fn on_request_complete(&self, _worker_url: &str, _success: bool) {
+    /// `tokens` is the number of prompt tokens in the completed request; pass 0
+    /// if the count is not known (stateless policies ignore it).
+    fn on_request_complete(&self, _worker_url: &str, _success: bool, _tokens: usize) {
         // Default: no-op for stateless policies
     }
 

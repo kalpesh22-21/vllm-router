@@ -987,6 +987,513 @@ impl Tree {
     }
 }
 
+// ===========================================================================================
+// Token-based radix tree (Phase 4)
+//
+// Stores Vec<u32> token-ID sequences instead of character strings.  Nodes are keyed by the
+// first token ID rather than the first character, which makes u32-SIMD comparison
+// straightforward and eliminates mid-token node splits.
+//
+// The public API mirrors the character-based Tree above:
+//   TokenTree::insert(tokens: &[u32], tenant: &str)
+//   TokenTree::prefix_match_with_counts(tokens: &[u32]) -> PrefixMatchTokenResult
+//   TokenTree::remove_tenant(tenant: &str)
+//   TokenTree::evict_tenant_by_size(max_size: usize)
+// ===========================================================================================
+
+/// Result of a token-based prefix match operation.
+#[derive(Debug, Clone)]
+pub struct PrefixMatchTokenResult {
+    /// The tenant that owns the matched prefix (zero-copy)
+    pub tenant: TenantId,
+    /// Number of tokens matched from the input
+    pub matched_token_count: usize,
+    /// Total number of tokens in the input sequence
+    pub input_token_count: usize,
+}
+
+/// A radix-tree node whose edges are keyed by a leading `u32` token ID.
+#[derive(Debug)]
+struct TokenNode {
+    /// Token slice stored in this node (may span multiple token IDs)
+    tokens: RwLock<Vec<u32>>,
+    /// Children indexed by their first token ID
+    children: DashMap<u32, Arc<TokenNode>>,
+    /// Per-tenant last-access epoch for LRU eviction
+    tenant_last_access_time: DashMap<TenantId, u64>,
+    /// Parent pointer used when removing empty nodes after eviction
+    parent: RwLock<Option<Arc<TokenNode>>>,
+    /// Cached last-seen tenant for O(1) prefix-match result lookup
+    last_tenant: parking_lot::RwLock<Option<TenantId>>,
+}
+
+/// Token-based multi-tenant radix tree.
+///
+/// Semantics are identical to the character-based `Tree`, but every edge
+/// carries a sequence of `u32` token IDs rather than characters.  This lets
+/// the KV-cache routing policy track prefix matches in terms of real token
+/// boundaries instead of raw character offsets.
+#[derive(Debug)]
+pub struct TokenTree {
+    root: Arc<TokenNode>,
+    /// Running token count per tenant — used by `evict_tenant_by_size`
+    /// (size measured in tokens, not chars).
+    pub tenant_token_count: DashMap<TenantId, usize>,
+}
+
+impl Default for TokenTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Priority-queue entry for TokenTree LRU eviction.
+/// Older timestamps (smaller values) sort as "larger" so they pop first from a max-heap
+/// when wrapped in `Reverse<_>`.
+struct TokenEvictTokenEntry {
+    timestamp: u64,
+    tenant: TenantId,
+    node: Arc<TokenNode>,
+}
+
+impl Eq for TokenEvictTokenEntry {}
+
+impl PartialEq for TokenEvictTokenEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+    }
+}
+
+impl PartialOrd for TokenEvictTokenEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.timestamp.cmp(&other.timestamp))
+    }
+}
+
+impl Ord for TokenEvictTokenEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+/// Count the number of leading tokens that are equal between `a` and `b`.
+#[inline]
+fn shared_token_prefix_count(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+impl TokenTree {
+    pub fn new() -> Self {
+        TokenTree {
+            root: Arc::new(TokenNode {
+                tokens: RwLock::new(Vec::new()),
+                children: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+                tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+                parent: RwLock::new(None),
+                last_tenant: parking_lot::RwLock::new(None),
+            }),
+            tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+        }
+    }
+
+    /// Insert a token-ID sequence into the tree, associating it with `tenant`.
+    pub fn insert(&self, tokens: &[u32], tenant: &str) {
+        let tenant_id = intern_tenant(tenant);
+
+        // Ensure tenant record exists at root (root is never evicted)
+        self.root
+            .tenant_last_access_time
+            .entry(Arc::clone(&tenant_id))
+            .or_insert(0);
+        self.tenant_token_count
+            .entry(Arc::clone(&tenant_id))
+            .or_insert(0);
+
+        let mut remaining: &[u32] = tokens;
+        let mut prev = Arc::clone(&self.root);
+
+        enum InsertStep {
+            Done,
+            Continue {
+                next_prev: Arc<TokenNode>,
+                advance: usize,
+            },
+        }
+
+        while !remaining.is_empty() {
+            let first_token = remaining[0];
+
+            let step = match prev.children.entry(first_token) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    // No matching child — create a new leaf with all remaining tokens
+                    let leaf_len = remaining.len();
+                    let epoch = get_epoch();
+
+                    let new_node = Arc::new(TokenNode {
+                        tokens: RwLock::new(remaining.to_vec()),
+                        children: DashMap::with_shard_amount(NODE_SHARD_COUNT),
+                        tenant_last_access_time: DashMap::with_shard_amount(NODE_SHARD_COUNT),
+                        parent: RwLock::new(Some(Arc::clone(&prev))),
+                        last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
+                    });
+
+                    self.tenant_token_count
+                        .entry(Arc::clone(&tenant_id))
+                        .and_modify(|c| *c += leaf_len)
+                        .or_insert(leaf_len);
+                    new_node
+                        .tenant_last_access_time
+                        .insert(Arc::clone(&tenant_id), epoch);
+
+                    entry.insert(new_node);
+                    InsertStep::Done
+                }
+
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    let matched_node = entry.get().clone();
+                    let node_tokens = matched_node.tokens.read().unwrap();
+                    let node_len = node_tokens.len();
+                    let shared = shared_token_prefix_count(remaining, &node_tokens);
+
+                    if shared < node_len {
+                        // Partial match — split the node
+                        let split_tokens: Vec<u32> = node_tokens[..shared].to_vec();
+                        let suffix_tokens: Vec<u32> = node_tokens[shared..].to_vec();
+                        let split_len = shared;
+                        drop(node_tokens);
+
+                        let split_node = Arc::new(TokenNode {
+                            tokens: RwLock::new(split_tokens),
+                            children: DashMap::with_shard_amount(NODE_SHARD_COUNT),
+                            parent: RwLock::new(Some(Arc::clone(&prev))),
+                            tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
+                            last_tenant: parking_lot::RwLock::new(
+                                matched_node.last_tenant.read().clone(),
+                            ),
+                        });
+
+                        let suffix_first = suffix_tokens[0];
+                        split_node
+                            .children
+                            .insert(suffix_first, Arc::clone(&matched_node));
+                        entry.insert(Arc::clone(&split_node));
+
+                        *matched_node.tokens.write().unwrap() = suffix_tokens;
+                        *matched_node.parent.write().unwrap() = Some(Arc::clone(&split_node));
+
+                        // Attach the new tenant to the split (intermediate) node if not already there
+                        if !split_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
+                            self.tenant_token_count
+                                .entry(Arc::clone(&tenant_id))
+                                .and_modify(|c| *c += split_len)
+                                .or_insert(split_len);
+                            split_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
+                        }
+
+                        InsertStep::Continue {
+                            next_prev: split_node,
+                            advance: shared,
+                        }
+                    } else {
+                        // Full match with node — descend into it
+                        drop(node_tokens);
+
+                        if !matched_node
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                        {
+                            self.tenant_token_count
+                                .entry(Arc::clone(&tenant_id))
+                                .and_modify(|c| *c += node_len)
+                                .or_insert(node_len);
+                            matched_node
+                                .tenant_last_access_time
+                                .insert(Arc::clone(&tenant_id), 0);
+                        }
+
+                        InsertStep::Continue {
+                            next_prev: matched_node,
+                            advance: shared,
+                        }
+                    }
+                }
+            };
+
+            match step {
+                InsertStep::Done => return,
+                InsertStep::Continue { next_prev, advance } => {
+                    prev = next_prev;
+                    remaining = &remaining[advance..];
+                }
+            }
+        }
+
+        // Reached end of input — `prev` is the leaf; stamp it
+        let epoch = get_epoch();
+        prev.tenant_last_access_time
+            .insert(Arc::clone(&tenant_id), epoch);
+    }
+
+    /// Return the best-matching tenant and token counts for a query sequence.
+    pub fn prefix_match_with_counts(&self, tokens: &[u32]) -> PrefixMatchTokenResult {
+        let mut remaining: &[u32] = tokens;
+        let mut matched_tokens: usize = 0;
+        let mut prev = Arc::clone(&self.root);
+
+        while !remaining.is_empty() {
+            let first_token = remaining[0];
+
+            let child = prev.children.get(&first_token).map(|e| e.value().clone());
+
+            if let Some(matched_node) = child {
+                let node_tokens = matched_node.tokens.read().unwrap();
+                let node_len = node_tokens.len();
+                let shared = shared_token_prefix_count(remaining, &node_tokens);
+                drop(node_tokens);
+
+                matched_tokens += shared;
+                remaining = &remaining[shared..];
+                prev = Arc::clone(&matched_node);
+
+                if shared < node_len {
+                    // Partial match — stop traversal
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let curr = prev;
+
+        // Resolve tenant: check cache first, then iterate
+        let tenant: TenantId = {
+            let cached = curr.last_tenant.read();
+            if let Some(ref t) = *cached {
+                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
+                    Arc::clone(t)
+                } else {
+                    drop(cached);
+                    let t = curr
+                        .tenant_last_access_time
+                        .iter()
+                        .next()
+                        .map(|kv| Arc::clone(kv.key()))
+                        .unwrap_or_else(|| Arc::from("empty"));
+                    *curr.last_tenant.write() = Some(Arc::clone(&t));
+                    t
+                }
+            } else {
+                drop(cached);
+                let t = curr
+                    .tenant_last_access_time
+                    .iter()
+                    .next()
+                    .map(|kv| Arc::clone(kv.key()))
+                    .unwrap_or_else(|| Arc::from("empty"));
+                *curr.last_tenant.write() = Some(Arc::clone(&t));
+                t
+            }
+        };
+
+        // Probabilistic timestamp update (1-in-8) to reduce DashMap contention
+        let epoch = get_epoch();
+        if epoch & 0x7 == 0 {
+            curr.tenant_last_access_time
+                .insert(Arc::clone(&tenant), epoch);
+        }
+
+        PrefixMatchTokenResult {
+            tenant,
+            matched_token_count: matched_tokens,
+            input_token_count: tokens.len(),
+        }
+    }
+
+    /// Remove all tree entries belonging to `tenant`.
+    pub fn remove_tenant(&self, tenant: &str) {
+        let tenant_id = intern_tenant(tenant);
+
+        // Collect leaf nodes for this tenant
+        let mut stack = vec![Arc::clone(&self.root)];
+        let mut leaves: std::collections::VecDeque<Arc<TokenNode>> =
+            std::collections::VecDeque::new();
+
+        while let Some(curr) = stack.pop() {
+            for child in curr.children.iter() {
+                stack.push(Arc::clone(child.value()));
+            }
+            if curr
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                let has_child_with_tenant = curr.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant_id.as_ref())
+                });
+                if !has_child_with_tenant {
+                    leaves.push_back(Arc::clone(&curr));
+                }
+            }
+        }
+
+        while let Some(curr) = leaves.pop_front() {
+            curr.tenant_last_access_time.remove(tenant_id.as_ref());
+
+            let parent_opt = curr.parent.read().unwrap().clone();
+
+            if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
+                if let Some(ref parent) = parent_opt {
+                    let tokens = curr.tokens.read().unwrap();
+                    if let Some(&first) = tokens.first() {
+                        parent.children.remove(&first);
+                    }
+                }
+            }
+
+            if let Some(ref parent) = parent_opt {
+                if parent
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
+                {
+                    let has_child_with_tenant = parent.children.iter().any(|child| {
+                        child
+                            .value()
+                            .tenant_last_access_time
+                            .contains_key(tenant_id.as_ref())
+                    });
+                    if !has_child_with_tenant {
+                        leaves.push_back(Arc::clone(parent));
+                    }
+                }
+            }
+        }
+
+        self.tenant_token_count.remove(tenant_id.as_ref());
+    }
+
+    /// Evict LRU leaf nodes until each tenant's token count is at most `max_size`.
+    pub fn evict_tenant_by_size(&self, max_size: usize) {
+        // Helper: collect leaf-tenant pairs for a node
+        let leaf_tenants = |node: &Arc<TokenNode>| -> Vec<TenantId> {
+            let mut candidates: HashMap<TenantId, bool> = node
+                .tenant_last_access_time
+                .iter()
+                .map(|e| (Arc::clone(e.key()), true))
+                .collect();
+            for child in node.children.iter() {
+                for t in child.value().tenant_last_access_time.iter() {
+                    candidates.insert(Arc::clone(t.key()), false);
+                }
+            }
+            candidates
+                .into_iter()
+                .filter(|(_, is_leaf)| *is_leaf)
+                .map(|(t, _)| t)
+                .collect()
+        };
+
+        let mut token_pq: BinaryHeap<Reverse<TokenEvictTokenEntry>> = BinaryHeap::new();
+        let mut stack = vec![Arc::clone(&self.root)];
+
+        while let Some(curr) = stack.pop() {
+            for child in curr.children.iter() {
+                stack.push(Arc::clone(child.value()));
+            }
+            for tenant in leaf_tenants(&curr) {
+                if let Some(ts) = curr.tenant_last_access_time.get(tenant.as_ref()) {
+                    token_pq.push(Reverse(TokenEvictTokenEntry {
+                        timestamp: *ts,
+                        tenant: Arc::clone(&tenant),
+                        node: Arc::clone(&curr),
+                    }));
+                }
+            }
+        }
+
+        while let Some(Reverse(entry)) = token_pq.pop() {
+            let TokenEvictTokenEntry { tenant, node, .. } = entry;
+
+            if let Some(used) = self.tenant_token_count.get(tenant.as_ref()) {
+                if *used <= max_size {
+                    continue;
+                }
+            }
+
+            // Verify still a leaf for this tenant
+            let is_still_leaf = node.tenant_last_access_time.contains_key(tenant.as_ref())
+                && !node.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant.as_ref())
+                });
+            if !is_still_leaf {
+                continue;
+            }
+
+            let node_len = node.tokens.read().unwrap().len();
+            self.tenant_token_count
+                .entry(Arc::clone(&tenant))
+                .and_modify(|c| *c = c.saturating_sub(node_len));
+
+            node.tenant_last_access_time.remove(tenant.as_ref());
+
+            let parent_opt = node.parent.read().unwrap().clone();
+
+            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+                if let Some(ref parent) = parent_opt {
+                    let tokens = node.tokens.read().unwrap();
+                    if let Some(&first) = tokens.first() {
+                        parent.children.remove(&first);
+                    }
+                }
+            }
+
+            if let Some(ref parent) = parent_opt {
+                if parent
+                    .tenant_last_access_time
+                    .contains_key(tenant.as_ref())
+                {
+                    let has_child_with_tenant = parent.children.iter().any(|child| {
+                        child
+                            .value()
+                            .tenant_last_access_time
+                            .contains_key(tenant.as_ref())
+                    });
+                    if !has_child_with_tenant {
+                        token_pq.push(Reverse(TokenEvictTokenEntry {
+                            timestamp: parent
+                                .tenant_last_access_time
+                                .get(tenant.as_ref())
+                                .map(|v| *v)
+                                .unwrap_or(0),
+                            tenant: Arc::clone(&tenant),
+                            node: Arc::clone(parent),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return token counts per tenant (for diagnostics / tests).
+    #[allow(dead_code)]
+    pub fn get_tenant_token_count(&self) -> HashMap<String, usize> {
+        self.tenant_token_count
+            .iter()
+            .map(|e| (e.key().to_string(), *e.value()))
+            .collect()
+    }
+}
+
 //  Unit tests
 #[cfg(test)]
 mod tests {

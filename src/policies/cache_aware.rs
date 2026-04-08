@@ -63,14 +63,14 @@ use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, R
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
-use crate::tree::Tree;
+use crate::tree::TokenTree;
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Cache-aware routing policy
 ///
@@ -80,8 +80,9 @@ use tracing::{debug, info};
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
-    trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
+    trees: Arc<DashMap<String, Arc<TokenTree>>>, // model_id -> Arc<TokenTree>
     eviction_handle: Option<thread::JoinHandle<()>>,
+    client: reqwest::Client,
 }
 
 impl CacheAwarePolicy {
@@ -90,7 +91,7 @@ impl CacheAwarePolicy {
     }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
-        let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
@@ -120,6 +121,7 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+            client: reqwest::Client::new(),
         }
     }
 
@@ -129,8 +131,8 @@ impl CacheAwarePolicy {
         let tree = self
             .trees
             .entry(tree_key.to_string())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        tree.insert("", worker.url());
+            .or_insert_with(|| Arc::new(TokenTree::new()));
+        tree.insert(&[], worker.url());
     }
 
     /// Add a worker by URL and model (for backward compatibility)
@@ -138,8 +140,8 @@ impl CacheAwarePolicy {
         let tree = self
             .trees
             .entry(model_id.to_string())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        tree.insert("", url);
+            .or_insert_with(|| Arc::new(TokenTree::new()));
+        tree.insert(&[], url);
     }
 
     /// Remove a worker from the tree
@@ -174,7 +176,7 @@ impl CacheAwarePolicy {
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        token_ids: &[u32],
         healthy_indices: &[usize],
         model_id: &str,
         max_load: usize,
@@ -200,14 +202,12 @@ impl CacheAwarePolicy {
             .copied()?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
+        if !token_ids.is_empty() {
             let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
+                tree.insert(token_ids, worker_url);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -216,13 +216,41 @@ impl CacheAwarePolicy {
             }
         }
 
-        // Increment processed counter
         workers[min_load_idx].increment_processed();
         RouterMetrics::record_processed_request(workers[min_load_idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
     }
+}
+
+/// Tokenize `prompt` by calling the vLLM `/tokenize` endpoint on `worker_url`.
+/// Returns `(token_ids, token_count)` on success.
+async fn tokenize_prompt(
+    client: &reqwest::Client,
+    worker_url: &str,
+    model: &str,
+    prompt: &str,
+) -> anyhow::Result<(Vec<u32>, usize)> {
+    let url = format!("{}/tokenize", worker_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "model": model, "prompt": prompt });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let json: serde_json::Value = resp.json().await?;
+    let tokens: Vec<u32> = json["tokens"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing `tokens` field"))?
+        .iter()
+        .map(|v| v.as_u64().unwrap_or(0) as u32)
+        .collect();
+    let count = tokens.len();
+    Ok((tokens, count))
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
@@ -241,6 +269,37 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        // Tokenize the prompt on a randomly selected healthy worker.
+        // Falls back to empty token slice when no runtime is available (unit tests)
+        // or when the tokenize endpoint returns an error.
+        let token_ids: Vec<u32> = if let Some(text) = request_text {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let worker_url = {
+                    let mut rng = rand::rng();
+                    let idx = rng.random_range(0..healthy_indices.len());
+                    workers[healthy_indices[idx]].url().to_string()
+                };
+                let model = workers[healthy_indices[0]].model_id().to_string();
+                let text_owned = text.to_string();
+                let client = self.client.clone();
+
+                match tokio::task::block_in_place(|| {
+                    handle.block_on(tokenize_prompt(&client, &worker_url, &model, &text_owned))
+                }) {
+                    Ok((ids, _)) => ids,
+                    Err(e) => {
+                        warn!("Tokenize failed for model '{}': {}", model_id, e);
+                        vec![]
+                    }
+                }
+            } else {
+                // No tokio runtime (e.g. unit tests) — skip tokenization
+                vec![]
+            }
+        } else {
+            vec![]
+        };
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -261,7 +320,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if is_imbalanced {
             return self.select_worker_min_load(
                 workers,
-                request_text,
+                &token_ids,
                 &healthy_indices,
                 model_id,
                 max_load,
@@ -270,10 +329,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
-
-        // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
         let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
@@ -296,20 +351,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             return Some(selected_idx);
         };
+
         debug!("Using cache-aware routing for model '{}'", model_id);
-        // Now we work with the tree without holding the HashMap lock
-        // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
-        let match_rate = if result.input_char_count == 0 {
+
+        let result = tree.prefix_match_with_counts(&token_ids);
+        let match_rate = if result.input_token_count == 0 {
             0.0
         } else {
-            result.matched_char_count as f32 / result.input_char_count as f32
+            result.matched_token_count as f32 / result.input_token_count as f32
         };
 
         debug!(
-            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
-            model_id, result.matched_char_count, result.input_char_count, match_rate
+            "Cache match for model '{}': matched_tokens={}, input_tokens={}, match_rate={:.2}",
+            model_id, result.matched_token_count, result.input_token_count, match_rate
         );
+
         // Select worker without String allocation
         let selected_idx = if match_rate > self.config.cache_threshold {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
@@ -327,10 +383,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
 
         if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no allocation)
-            tree.insert(text, workers[idx].url());
+            // Update the tree with this request's tokens
+            if !token_ids.is_empty() {
+                tree.insert(&token_ids, workers[idx].url());
+            }
 
-            // Increment processed counter
             workers[idx].increment_processed();
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
@@ -365,7 +422,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
+    fn on_request_complete(&self, worker_url: &str, success: bool, _tokens: usize) {
         // Could track success rates per worker for more intelligent routing
         if !success {
             // Optionally reduce affinity for failed requests
@@ -447,10 +504,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let tree = self
                 .trees
                 .entry(tree_key)
-                .or_insert_with(|| Arc::new(Tree::new()))
+                .or_insert_with(|| Arc::new(TokenTree::new()))
                 .clone();
             for worker in model_workers {
-                tree.insert("", worker.url());
+                tree.insert(&[], worker.url());
             }
         }
     }
